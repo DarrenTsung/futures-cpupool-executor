@@ -39,6 +39,9 @@
 
 extern crate futures;
 extern crate num_cpus;
+extern crate tokio;
+extern crate tokio_executor;
+extern crate tokio_current_thread;
 
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::{Arc, Mutex};
@@ -47,7 +50,8 @@ use std::sync::mpsc;
 use std::thread;
 use std::fmt;
 
-use futures::{IntoFuture, Future, Poll, Async};
+use futures::sync::mpsc as FuturesMpsc;
+use futures::{IntoFuture, Stream, Future, Poll, Async};
 use futures::future::{lazy, Executor, ExecuteError};
 use futures::sync::oneshot::{channel, Sender, Receiver};
 use futures::executor::{self, Run, Executor as OldExecutor};
@@ -249,7 +253,11 @@ impl Inner {
         self.tx.lock().unwrap().send(msg).unwrap();
     }
 
-    fn work(&self, after_start: Option<Arc<Fn() + Send + Sync>>, before_stop: Option<Arc<Fn() + Send + Sync>>) {
+    fn work(
+        &self,
+        after_start: Option<Arc<Fn() + Send + Sync>>,
+        before_stop: Option<Arc<Fn() + Send + Sync>>,
+    ) {
         after_start.map(|fun| fun());
         loop {
             let msg = self.rx.lock().unwrap().recv().unwrap();
@@ -413,6 +421,8 @@ impl Builder {
         };
         assert!(self.pool_size > 0);
 
+        let (sender, receiver) = FuturesMpsc::unbounded();
+
         for counter in 0..self.pool_size {
             let inner = pool.inner.clone();
             let after_start = self.after_start.clone();
@@ -424,9 +434,64 @@ impl Builder {
             if self.stack_size > 0 {
                 thread_builder = thread_builder.stack_size(self.stack_size);
             }
-            thread_builder.spawn(move || inner.work(after_start, before_stop)).unwrap();
+
+            let sender_clone = sender.clone();
+            thread_builder.spawn(move || {
+                // Binds an executor to this thread
+                let mut enter = tokio_executor::enter().expect("Multiple executors at once");
+                let mut executor = ExecutorSender(sender_clone);
+
+                tokio_executor::with_default(&mut executor, &mut enter, |_enter| {
+                    inner.work(after_start, before_stop)
+                })
+            }).unwrap();
         }
+
+        // Create the tokio executor thread, runs futures that are spawned
+        // off of the cpu-threads
+        let mut thread_builder = thread::Builder::new();
+        if let Some(ref name_prefix) = self.name_prefix {
+            thread_builder = thread_builder.name(format!("{}-tokio-executor", name_prefix));
+        }
+        if self.stack_size > 0 {
+            thread_builder = thread_builder.stack_size(self.stack_size);
+        }
+        thread_builder.spawn(move || {
+            let _ = tokio_current_thread::block_on_all(ExecutorReceiver(receiver));
+        }).unwrap();
         return pool
+    }
+}
+
+struct ExecutorSender(FuturesMpsc::UnboundedSender<Box<Future<Item = (), Error = ()> + Send>>);
+
+impl tokio_executor::Executor for ExecutorSender {
+    fn spawn(
+        &mut self,
+        future: Box<Future<Item = (), Error = ()> + Send>
+    ) -> Result<(), tokio_executor::SpawnError>
+    {
+        self.0.unbounded_send(future).unwrap();
+        Ok(())
+    }
+}
+
+struct ExecutorReceiver(FuturesMpsc::UnboundedReceiver<Box<Future<Item = (), Error = ()> + Send>>);
+
+impl Future for ExecutorReceiver {
+    type Item = ();
+    type Error = ();
+
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        loop {
+            match self.0.poll() {
+                Ok(Async::Ready(Some(future))) => {
+                    tokio_current_thread::spawn(future);
+                },
+                Ok(Async::Ready(None)) | Err(_) => return Ok(Async::Ready(())),
+                _ => return Ok(Async::NotReady),
+            }
+        }
     }
 }
 
